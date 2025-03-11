@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "curso_nest",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}
