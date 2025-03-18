@@ -2,7 +2,7 @@ import { BadGatewayException, Injectable, InternalServerErrorException, Logger, 
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DeepPartial, Repository } from 'typeorm';
+import { DataSource, DeepPartial, Repository } from 'typeorm';
 import { Product } from './entities/product.entity';
 import { PaginationDto } from 'src/common/dto/pagination.dto';
 import { validate as isUUID } from 'uuid'
@@ -18,7 +18,9 @@ export class ProductsService {
     private readonly productRepository: Repository<Product>,
 
     @InjectRepository(ProductImage)
-    private readonly productImageRepository: Repository<ProductImage>
+    private readonly productImageRepository: Repository<ProductImage>,
+
+    private readonly dataSource: DataSource
   ){}
 
   async create(createProductDto: CreateProductDto) {
@@ -91,23 +93,77 @@ export class ProductsService {
 
 
 
+  /**
+   * Método para actualizar un producto existente, incluyendo sus imágenes
+   * @param id Identificador único del producto
+   * @param updateProductDto DTO con los datos actualizados del producto
+   */
   async update(id: string, updateProductDto: UpdateProductDto) {
-    const product = await this.productRepository.preload({
-      id, // aqui busca por medio de la id
-      ...updateProductDto as DeepPartial<Product>,
-      images:[]// aseguramos que los valores coincidan con el tipo esperado
+    // Desestructuramos el DTO para separar las imágenes del resto de propiedades
+    // images: contiene el array de URLs de imágenes (si existe)
+    // toUpdate: contiene el resto de propiedades a actualizar
+    const { images, ...toUpdate } = updateProductDto
+
+    // Buscamos el producto en la base de datos incluyendo sus imágenes actuales
+    const existingProduct = await this.productRepository.findOne({
+      where: { id },          // Buscamos por el ID proporcionado
+      relations: ['images']   // Incluimos la relación con la tabla de imágenes
     });
 
-    if ( !product ) throw new NotFoundException(`Product with id: ${ id } not found`)
-  
-    try {
-      await this.productRepository.save( product )
-      return product
-    } catch (error) {
-      this.handleDbExceptions(error)
+    // Si no encontramos el producto, lanzamos una excepción
+    if (!existingProduct) {
+      throw new NotFoundException(`Product with id: ${id} not found`);
     }
 
+    // Usamos preload para crear una entidad con los nuevos datos
+    // pero manteniendo las relaciones existentes
+    const product = await this.productRepository.preload({
+      id,                                    // ID del producto a actualizar
+      ...toUpdate as DeepPartial<Product>,   // Nuevas propiedades del producto
+      images: existingProduct.images         // Mantenemos las imágenes existentes
+    });
+
+    // Verificación adicional después de preload
+    if (!product) {
+      throw new NotFoundException(`Product with id: ${id} not found`);
     }
+
+    // Creamos un queryRunner para manejar la transacción
+    const queryRunner = this.dataSource.createQueryRunner();
+    // Conectamos el queryRunner a la base de datos
+    await queryRunner.connect();
+    // Iniciamos la transacción
+    await queryRunner.startTransaction();
+
+    try {
+      // Si se proporcionaron nuevas imágenes en el DTO
+      if (images) {
+        // Eliminamos todas las imágenes actuales del producto
+        await queryRunner.manager.delete(ProductImage, { product: { id } });
+        // Creamos nuevas entidades de imagen y las asignamos al producto
+        product.images = images.map(image => 
+          this.productImageRepository.create({ url: image })
+        );
+      }
+
+      // Guardamos el producto actualizado en la base de datos
+      await queryRunner.manager.save(product);
+      // Confirmamos la transacción
+      await queryRunner.commitTransaction();
+      // Liberamos el queryRunner
+      await queryRunner.release();
+
+      // Retornamos el producto actualizado en formato plano
+      return this.findOnePlain(id);
+    } catch (error) {
+      // Si ocurre algún error, revertimos la transacción
+      await queryRunner.rollbackTransaction();
+      // Liberamos el queryRunner
+      await queryRunner.release();
+      // Manejamos la excepción de base de datos
+      this.handleDbExceptions(error);
+    }
+  }
 
   async remove(id: string) {
     const product = await this.findOne(id)
@@ -122,6 +178,18 @@ export class ProductsService {
 
     this.logger.error(error)
     throw new InternalServerErrorException('Unexpected error, check server logs')
+  }
+
+  async deleteAllProducts() {
+    const query = this.productRepository.createQueryBuilder('product')
+    
+    try {
+      return await query.delete().where({}).execute()  
+    } catch (error) {
+      this.handleDbExceptions(error)
+    }
+
+    
   }
 
 }
